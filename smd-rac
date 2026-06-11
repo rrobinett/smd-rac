@@ -15,6 +15,7 @@ the unavoidable RAC artifacts:
 Verbs:
     smd-rac [status]                       show tunnel status (default)
     smd-rac install --id ID --number N     provision frpc + register + start
+    smd-rac uninstall [--purge]            stop + remove all RAC artifacts
     smd-rac start | stop | restart         lifecycle of wd-rac.service
 
 Mutating verbs auto-elevate via sudo (re-exec) when not run as root.
@@ -662,6 +663,76 @@ def _lifecycle(action: str) -> int:
     return 0
 
 
+def _uninstall(purge: bool, dry_run: bool, yes: bool) -> int:
+    """Cleanly tear down everything `install` created: stop + disable the
+    service, then remove the unit, frpc binary, config, keypair, and CA cert.
+    Leaves the credentials env file unless --purge is given."""
+    if _need_root('uninstall'):
+        return 1
+    _heading('wd-rac (Remote Access Channel) — uninstall')
+    unit = f'{_RAC_SERVICE}.service'
+    unit_path = Path(f'/etc/systemd/system/{unit}')
+
+    files = [_FRPC_CONFIG, _FRPC_INI, _FRPC_KEY, Path(str(_FRPC_KEY) + '.pub'),
+             _FRPS_CA_CERT, _FRPC_BIN]
+    if purge:
+        files.append(_SECRET_ENV_FILE)
+
+    if not yes and not dry_run and sys.stdin.isatty():
+        print()
+        _warn(f'This stops/disables {unit} and removes:')
+        for t in [unit_path] + files:
+            print(f'       {t}{"" if t.exists() else "  (absent)"}')
+        try:
+            if input('  Proceed? [y/N]: ').strip().lower() not in ('y', 'yes'):
+                _info('aborted')
+                return 1
+        except (EOFError, KeyboardInterrupt):
+            print()
+            _info('aborted')
+            return 1
+
+    if dry_run:
+        _info(f'dry-run: would stop + disable {unit}')
+        for t in [unit_path] + files:
+            if t.exists():
+                _info(f'dry-run: would remove {t}')
+        return 0
+
+    # 1) stop + disable + remove the unit
+    if unit_path.exists():
+        _run(['systemctl', 'disable', '--now', unit], sudo=True)
+        _run(['rm', '-f', str(unit_path)], sudo=True)
+        _run(['systemctl', 'daemon-reload'], sudo=True)
+        _ok(f'{unit}: stopped, disabled, removed')
+    else:
+        _info(f'{unit}: not installed')
+
+    # 2) remove install artifacts
+    for t in files:
+        if not t.exists():
+            _info(f'absent: {t}')
+            continue
+        r = _run(['rm', '-f', str(t)], sudo=True)
+        if r.returncode == 0:
+            _ok(f'removed {t}')
+        else:
+            _warn(f'could not remove {t}: {r.stderr.strip()}')
+
+    # 3) on --purge, drop /etc/sigmond if we emptied it
+    if purge:
+        d = _FRPC_CONFIG.parent
+        try:
+            if d.exists() and not any(d.iterdir()):
+                _run(['rmdir', str(d)], sudo=True)
+                _ok(f'removed empty {d}')
+        except OSError:
+            pass
+
+    _ok('wd-rac uninstalled')
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI.
 # ---------------------------------------------------------------------------
@@ -684,6 +755,15 @@ def main(argv=None) -> int:
                     help='show what would happen without changing anything')
     pi.add_argument('--yes', action='store_true',
                     help='non-interactive; do not prompt for missing id/number')
+    pun = sub.add_parser('uninstall',
+                         help='stop the tunnel and remove all RAC artifacts')
+    pun.add_argument('--purge', action='store_true',
+                     help='also remove the credentials env file '
+                          f'({_SECRET_ENV_FILE}) and empty /etc/sigmond')
+    pun.add_argument('--dry-run', action='store_true',
+                     help='show what would be removed without changing anything')
+    pun.add_argument('--yes', action='store_true',
+                     help='do not prompt for confirmation')
 
     args = p.parse_args(argv)
     cmd = args.command or 'status'
@@ -693,6 +773,8 @@ def main(argv=None) -> int:
     if cmd == 'install':
         return _install(args.rac_id.strip(), args.rac_number,
                         args.dry_run, args.yes)
+    if cmd == 'uninstall':
+        return _uninstall(args.purge, args.dry_run, args.yes)
     if cmd in ('start', 'stop', 'restart'):
         return _lifecycle(cmd)
     p.print_help()
