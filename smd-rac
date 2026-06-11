@@ -177,7 +177,10 @@ def _install_frpc(dry_run: bool = False) -> bool:
                 _err('frpc not found in downloaded archive')
                 return False
             member.name = 'frpc'
-            tf.extract(member, path=tmp)
+            # Python 3.12+ warns (3.14 will error) when extracting without an
+            # explicit filter; use the safe 'data' filter where it's available.
+            extract_kwargs = {'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}
+            tf.extract(member, path=tmp, **extract_kwargs)
         frpc_extracted = Path(tmp) / 'frpc'
         r = _run(['install', '-m', '755', str(frpc_extracted), str(_FRPC_BIN)],
                  sudo=True)
