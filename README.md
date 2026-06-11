@@ -35,8 +35,10 @@ defaults? Skip `install.sh` and use `smd-rac` directly with an env file — see
 4. Registers the station with the gateway (uploads a tiny tar over FTP so the
    server auto-creates the account and authorizes the key — non-fatal; `frpc`
    retries regardless).
-5. Writes `/etc/sigmond/frpc.toml` (TLS + token auth; SSH proxy on
-   `35800 + <number>`, web proxy on `45800 + <number>`).
+5. Writes `/etc/sigmond/frpc.toml` (TLS + token auth). Two proxies:
+   an **SSH** proxy `35800 + <number>` → local `:22`, and a **web** proxy
+   `45800 + <number>` → local `:8006` (the Proxmox host UI by default; use
+   `--web-port` / `WD_RAC_WEB_LOCAL_PORT` to target e.g. `8081` for ka9q-web).
 6. Installs, enables, and starts `wd-rac.service`.
 
 ## Verbs
@@ -44,7 +46,7 @@ defaults? Skip `install.sh` and use `smd-rac` directly with an env file — see
 | Command | Action |
 |---|---|
 | `smd-rac` or `smd-rac status` | Show tunnel status (binary, config, service, gateway reachability) |
-| `smd-rac install --id <ID> --number <N>` | Full provisioning (above). `--dry-run` to preview, `--yes` to skip prompts |
+| `smd-rac install --id <ID> --number <N>` | Full provisioning (above). `--dry-run` to preview, `--yes` to skip prompts, `--web-port <P>` to set the web proxy's local target (default 8006) |
 | `smd-rac uninstall` | Stop + disable the service and remove all RAC artifacts (unit, frpc, config, keypair, CA cert, PATH symlink, completion). `--purge` also removes the credentials env file; `--dry-run`/`--yes` as usual |
 | `smd-rac start` \| `stop` \| `restart` | Lifecycle of `wd-rac.service` |
 | `smd-rac completion [--install]` | Print the bash completion script, or `--install` it (symlink onto PATH + `/etc/bash_completion.d/smd-rac`) |

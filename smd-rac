@@ -52,6 +52,10 @@ _FRPS_URL_HAMSCI = 'vpn.hamsci.org'
 _FRPS_PORT       = 35736                                  # secure frps port
 _RAC_PORT_BASE   = 35800
 _RAC_WEB_OFFSET  = 10000
+# Local target of the WEB proxy (remote port 45800+N). Defaults to 8006, the
+# Proxmox host's web UI, since smd-rac is almost always run on a Proxmox host.
+# Override with --web-port or WD_RAC_WEB_LOCAL_PORT (e.g. 8081 for ka9q-web).
+_DEFAULT_WEB_LOCAL_PORT = 8006
 _FRPC_BIN        = Path('/usr/local/sbin/frpc')
 _FRPC_INI        = Path('/etc/sigmond/frpc.ini')          # legacy — removed on install
 _FRPC_CONFIG     = Path('/etc/sigmond/frpc.toml')
@@ -366,13 +370,21 @@ def _fetch_frps_ca_cert(dry_run: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 # frpc.toml + systemd unit.
 # ---------------------------------------------------------------------------
-def _write_frpc_config(rac_id: str, rac_number: int, dry_run: bool = False) -> bool:
+def _write_frpc_config(rac_id: str, rac_number: int, dry_run: bool = False,
+                       web_local_port: int = None) -> bool:
     if not rac_id:
         _err('wd-rac: rac_id is empty')
         return False
     if rac_number < 0:
         _err('wd-rac: rac_number not set')
         return False
+
+    if web_local_port is None:
+        try:
+            web_local_port = int(os.environ.get('WD_RAC_WEB_LOCAL_PORT', '')
+                                 or _DEFAULT_WEB_LOCAL_PORT)
+        except ValueError:
+            web_local_port = _DEFAULT_WEB_LOCAL_PORT
 
     token = _secret('WD_RAC_FRPS_TOKEN')
     if not token:
@@ -428,7 +440,7 @@ def _write_frpc_config(rac_id: str, rac_number: int, dry_run: bool = False) -> b
         f'name = "{rac_id}-WEB"',
         'type = "tcp"',
         'localIP = "127.0.0.1"',
-        'localPort = 8081',
+        f'localPort = {web_local_port}',
         f'remotePort = {web_port}',
     ]
     content = '\n'.join(lines) + '\n'
@@ -457,7 +469,9 @@ def _write_frpc_config(rac_id: str, rac_number: int, dry_run: bool = False) -> b
     if r.returncode != 0:
         _err(f'frpc.toml write failed: {r.stderr.strip()}')
         return False
-    _ok(f'frpc.toml: written ({rac_id}, channel {rac_number}, port {ssh_port})')
+    _ok(f'frpc.toml: written ({rac_id}, channel {rac_number}; '
+        f'SSH {ssh_port}→127.0.0.1:{local_ssh_port}, '
+        f'WEB {web_port}→127.0.0.1:{web_local_port})')
     return True
 
 
@@ -654,7 +668,8 @@ def _install_completion(dry_run: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 # Install orchestrator (CLI-arg driven; no topology/wsprdaemon.conf needed).
 # ---------------------------------------------------------------------------
-def _install(rac_id: str, rac_number: int, dry_run: bool, yes: bool) -> int:
+def _install(rac_id: str, rac_number: int, dry_run: bool, yes: bool,
+             web_local_port: int = None) -> int:
     if _need_root('install'):
         return 1
     _heading('wd-rac (Remote Access Channel)')
@@ -699,7 +714,7 @@ def _install(rac_id: str, rac_number: int, dry_run: bool, yes: bool) -> int:
     ok = _ensure_frpc_keypair(dry_run) and ok
     ok = _fetch_frps_ca_cert(dry_run) and ok
     _bootstrap_rac_registration(rac_id, dry_run)            # non-fatal
-    ok = _write_frpc_config(rac_id, rac_number, dry_run) and ok
+    ok = _write_frpc_config(rac_id, rac_number, dry_run, web_local_port) and ok
     ok = _install_rac_service(dry_run) and ok
     _install_completion(dry_run)                            # non-fatal
     return 0 if ok else 1
@@ -815,6 +830,10 @@ def main(argv=None) -> int:
                     help='show what would happen without changing anything')
     pi.add_argument('--yes', action='store_true',
                     help='non-interactive; do not prompt for missing id/number')
+    pi.add_argument('--web-port', dest='web_local_port', type=int, default=None,
+                    help='local port the WEB proxy forwards to '
+                         f'(default {_DEFAULT_WEB_LOCAL_PORT} = Proxmox UI; '
+                         'use 8081 for ka9q-web)')
     pun = sub.add_parser('uninstall',
                          help='stop the tunnel and remove all RAC artifacts')
     pun.add_argument('--purge', action='store_true',
@@ -837,7 +856,7 @@ def main(argv=None) -> int:
         return _show_status()
     if cmd == 'install':
         return _install(args.rac_id.strip(), args.rac_number,
-                        args.dry_run, args.yes)
+                        args.dry_run, args.yes, args.web_local_port)
     if cmd == 'uninstall':
         return _uninstall(args.purge, args.dry_run, args.yes)
     if cmd == 'completion':
