@@ -17,6 +17,7 @@ Verbs:
     smd-rac install --id ID --number N     provision frpc + register + start
     smd-rac uninstall [--purge]            stop + remove all RAC artifacts
     smd-rac start | stop | restart         lifecycle of wd-rac.service
+    smd-rac completion [--install]         print/install bash tab-completion
 
 Mutating verbs auto-elevate via sudo (re-exec) when not run as root.
 
@@ -593,6 +594,64 @@ def _show_status() -> int:
 
 
 # ---------------------------------------------------------------------------
+# PATH symlink + bash tab-completion.
+# ---------------------------------------------------------------------------
+_PATH_LINK = Path('/usr/local/sbin/smd-rac')
+_COMPLETION_FILE = Path('/etc/bash_completion.d/smd-rac')
+
+
+def _completion_script() -> str:
+    return r'''# bash completion for smd-rac
+_smd_rac() {
+    local cur verb verbs
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    verbs="status start stop restart install uninstall completion"
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=( $(compgen -W "$verbs" -- "$cur") )
+        return 0
+    fi
+    verb="${COMP_WORDS[1]}"
+    case "$verb" in
+        install)    COMPREPLY=( $(compgen -W "--id --number --dry-run --yes" -- "$cur") ) ;;
+        uninstall)  COMPREPLY=( $(compgen -W "--purge --dry-run --yes" -- "$cur") ) ;;
+        completion) COMPREPLY=( $(compgen -W "--install" -- "$cur") ) ;;
+        *)          COMPREPLY=() ;;
+    esac
+    return 0
+}
+complete -F _smd_rac smd-rac
+'''
+
+
+def _install_completion(dry_run: bool = False) -> bool:
+    """Symlink this script onto PATH and drop a bash-completion file, so
+    `smd-rac <TAB>` completes verbs/flags in new shells. Non-fatal."""
+    self_path = Path(__file__).resolve()
+    if dry_run:
+        _info(f'dry-run: would symlink {_PATH_LINK} → {self_path}')
+        _info(f'dry-run: would write bash completion → {_COMPLETION_FILE}')
+        return True
+    _run(['ln', '-sf', str(self_path), str(_PATH_LINK)], sudo=True)
+    _ok(f'on PATH: {_PATH_LINK} → {self_path}')
+    if _COMPLETION_FILE.parent.is_dir():
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.bash', delete=False) as tf:
+            tf.write(_completion_script())
+            tf_path = tf.name
+        r = _run(['install', '-m', '644', tf_path, str(_COMPLETION_FILE)], sudo=True)
+        Path(tf_path).unlink(missing_ok=True)
+        if r.returncode == 0:
+            _ok(f'bash completion: {_COMPLETION_FILE}  (open a new shell, or '
+                f'`source {_COMPLETION_FILE}`)')
+        else:
+            _warn(f'could not write {_COMPLETION_FILE}: {r.stderr.strip()}')
+    else:
+        _info(f'{_COMPLETION_FILE.parent} absent — install the bash-completion '
+              f'package to enable tab completion')
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Install orchestrator (CLI-arg driven; no topology/wsprdaemon.conf needed).
 # ---------------------------------------------------------------------------
 def _install(rac_id: str, rac_number: int, dry_run: bool, yes: bool) -> int:
@@ -642,6 +701,7 @@ def _install(rac_id: str, rac_number: int, dry_run: bool, yes: bool) -> int:
     _bootstrap_rac_registration(rac_id, dry_run)            # non-fatal
     ok = _write_frpc_config(rac_id, rac_number, dry_run) and ok
     ok = _install_rac_service(dry_run) and ok
+    _install_completion(dry_run)                            # non-fatal
     return 0 if ok else 1
 
 
@@ -674,7 +734,7 @@ def _uninstall(purge: bool, dry_run: bool, yes: bool) -> int:
     unit_path = Path(f'/etc/systemd/system/{unit}')
 
     files = [_FRPC_CONFIG, _FRPC_INI, _FRPC_KEY, Path(str(_FRPC_KEY) + '.pub'),
-             _FRPS_CA_CERT, _FRPC_BIN]
+             _FRPS_CA_CERT, _FRPC_BIN, _PATH_LINK, _COMPLETION_FILE]
     if purge:
         files.append(_SECRET_ENV_FILE)
 
@@ -764,6 +824,11 @@ def main(argv=None) -> int:
                      help='show what would be removed without changing anything')
     pun.add_argument('--yes', action='store_true',
                      help='do not prompt for confirmation')
+    pc = sub.add_parser('completion',
+                        help='print the bash completion script (--install to '
+                             'put smd-rac on PATH and register it)')
+    pc.add_argument('--install', action='store_true',
+                    help='symlink onto PATH + write /etc/bash_completion.d/smd-rac')
 
     args = p.parse_args(argv)
     cmd = args.command or 'status'
@@ -775,6 +840,13 @@ def main(argv=None) -> int:
                         args.dry_run, args.yes)
     if cmd == 'uninstall':
         return _uninstall(args.purge, args.dry_run, args.yes)
+    if cmd == 'completion':
+        if args.install:
+            if _need_root('completion --install'):
+                return 1
+            return 0 if _install_completion() else 1
+        print(_completion_script())
+        return 0
     if cmd in ('start', 'stop', 'restart'):
         return _lifecycle(cmd)
     p.print_help()

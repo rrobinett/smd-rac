@@ -45,8 +45,17 @@ defaults? Skip `install.sh` and use `smd-rac` directly with an env file — see
 |---|---|
 | `smd-rac` or `smd-rac status` | Show tunnel status (binary, config, service, gateway reachability) |
 | `smd-rac install --id <ID> --number <N>` | Full provisioning (above). `--dry-run` to preview, `--yes` to skip prompts |
-| `smd-rac uninstall` | Stop + disable the service and remove all RAC artifacts (unit, frpc, config, keypair, CA cert). `--purge` also removes the credentials env file; `--dry-run`/`--yes` as usual |
+| `smd-rac uninstall` | Stop + disable the service and remove all RAC artifacts (unit, frpc, config, keypair, CA cert, PATH symlink, completion). `--purge` also removes the credentials env file; `--dry-run`/`--yes` as usual |
 | `smd-rac start` \| `stop` \| `restart` | Lifecycle of `wd-rac.service` |
+| `smd-rac completion [--install]` | Print the bash completion script, or `--install` it (symlink onto PATH + `/etc/bash_completion.d/smd-rac`) |
+
+### Tab completion
+
+`install` automatically symlinks `smd-rac` onto `PATH` (`/usr/local/sbin/smd-rac`)
+and registers bash completion, so in a **new shell** `smd-rac <TAB>` completes the
+verbs and flags. To add it to an already-installed host without re-running
+`install`, run `sudo smd-rac completion --install` (then open a new shell or
+`source /etc/bash_completion.d/smd-rac`). Requires the `bash-completion` package.
 
 `--number` is assigned by the RAC administrator and sets your tunnel ports.
 Numbers in `200–299` route through `vpn.hamsci.org` instead of `gw2`.
@@ -64,6 +73,8 @@ The only things it ever touches:
 /etc/sigmond/frpc_id_rsa[.pub]       dedicated keypair (if generated)
 /etc/sigmond/frps-ca.crt             gateway TLS CA
 /etc/systemd/system/wd-rac.service   the unit
+/usr/local/sbin/smd-rac              symlink onto PATH (tab completion)
+/etc/bash_completion.d/smd-rac       bash completion function
 ```
 
 ## Requirements
