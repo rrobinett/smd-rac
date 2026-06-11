@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# never commit a filled-in credentials file
+smd-rac.env
+*.env
+!*.env.example

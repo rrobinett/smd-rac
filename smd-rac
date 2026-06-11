@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""smd-rac — standalone WsprDaemon Remote Access Channel (frpc tunnel) manager.
+
+A self-contained extraction of `smd rac` from sigmond's `smd`, for hosts that
+should NOT carry a full sigmond install (e.g. a bare Proxmox host).  Pure
+stdlib — needs only system python3, ssh-keygen, and systemd.  It touches only
+the unavoidable RAC artifacts:
+
+    /usr/local/sbin/frpc          the frp client binary
+    /etc/sigmond/frpc.toml        tunnel config (TLS + token auth)
+    /etc/sigmond/frpc_id_rsa[.pub] dedicated keypair (gateway registration)
+    /etc/sigmond/frps-ca.crt      gateway TLS CA cert
+    /etc/systemd/system/wd-rac.service
+
+Verbs:
+    smd-rac [status]                       show tunnel status (default)
+    smd-rac install --id ID --number N     provision frpc + register + start
+    smd-rac start | stop | restart         lifecycle of wd-rac.service
+
+Mutating verbs auto-elevate via sudo (re-exec) when not run as root.
+
+Credentials are NOT stored in this file.  The fleet-shared frps auth token and
+the gateway FTP password are read at install time from the environment, or from
+an untracked env file (default /etc/sigmond/smd-rac.env, override SMD_RAC_ENV):
+    WD_RAC_FRPS_TOKEN   frps [auth] token         (required for install)
+    WD_RAC_FTP_PASSWD   gateway FTP password      (gateway auto-registration)
+    WD_RAC_FTP_USER     gateway FTP user          (default: noisegraphs)
+Both values are the constants published in the upstream WsprDaemon `smd`.
+See smd-rac.env.example.
+
+Extracted from sigmond  bin/smd @ e3ff3d9 (2026-06-08).  This is a *copy* of
+the RAC logic; if smd's frps host/port/token/registration flow changes, update
+the constants and the install path here to match.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Constants — mirror sigmond/bin/smd's WD-RAC block.
+# ---------------------------------------------------------------------------
+_FRPC_VERSION    = '0.64.0'
+_FRPS_URL        = 'gw2.wsprdaemon.org'
+_FRPS_URL_HAMSCI = 'vpn.hamsci.org'
+_FRPS_PORT       = 35736                                  # secure frps port
+_RAC_PORT_BASE   = 35800
+_RAC_WEB_OFFSET  = 10000
+_FRPC_BIN        = Path('/usr/local/sbin/frpc')
+_FRPC_INI        = Path('/etc/sigmond/frpc.ini')          # legacy — removed on install
+_FRPC_CONFIG     = Path('/etc/sigmond/frpc.toml')
+_FRPC_KEY        = Path('/etc/sigmond/frpc_id_rsa')
+_FRPS_CA_CERT    = Path('/etc/sigmond/frps-ca.crt')
+_RAC_SERVICE     = 'wd-rac'
+_WD_USER         = 'wsprdaemon'
+_WD_SSH_DIR      = Path(f'/home/{_WD_USER}/.ssh')
+
+
+# ---------------------------------------------------------------------------
+# Credentials — deliberately kept OUT of this file so it carries no secrets.
+# Resolved at runtime: real environment first, then an untracked env file
+# (default /etc/sigmond/smd-rac.env, override with SMD_RAC_ENV).
+# ---------------------------------------------------------------------------
+_SECRET_ENV_FILE = Path(os.environ.get('SMD_RAC_ENV', '/etc/sigmond/smd-rac.env'))
+_secret_file_cache = None
+
+
+def _read_secret_file() -> dict:
+    """Parse simple KEY=VALUE lines from the env file (comments/blanks ignored)."""
+    global _secret_file_cache
+    if _secret_file_cache is None:
+        _secret_file_cache = {}
+        try:
+            for raw in _SECRET_ENV_FILE.read_text().splitlines():
+                line = raw.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                _secret_file_cache[k.strip()] = v.strip().strip('"').strip("'")
+        except OSError:
+            pass
+    return _secret_file_cache
+
+
+def _secret(name: str, default: str = '') -> str:
+    """Resolve a credential: environment, then env file, then default ('')."""
+    return os.environ.get(name) or _read_secret_file().get(name) or default
+
+
+# ---------------------------------------------------------------------------
+# Low-level helpers (mirrors smd's _run / output helpers / _need_root).
+# ---------------------------------------------------------------------------
+def _run(cmd, *, cwd=None, capture=True, sudo=False, env=None):
+    if sudo and os.geteuid() != 0:
+        cmd = ['sudo'] + cmd
+    stdin_arg = subprocess.DEVNULL if not capture else None
+    return subprocess.run(cmd, cwd=cwd, capture_output=capture, text=True,
+                          stdin=stdin_arg, env=env)
+
+
+def _ok(msg):   print(f'  \033[32m✓\033[0m  {msg}')
+def _warn(msg): print(f'  \033[33m⚠\033[0m  {msg}')
+def _err(msg):  print(f'  \033[31m✗\033[0m  {msg}', file=sys.stderr)
+def _info(msg): print(f'     {msg}')
+def _heading(title): print(f'\n\033[1m━━━ {title} ━━━\033[0m')
+
+
+def _need_root(cmd_name: str) -> bool:
+    """Auto-elevate to root via sudo (re-exec same argv). Returns True only if
+    elevation is impossible (no sudo); callers should exit on True."""
+    if os.geteuid() == 0:
+        return False
+    sudo = shutil.which('sudo')
+    if sudo:
+        os.execvp(sudo, [sudo, '--', sys.executable, *sys.argv])
+    print(f'smd-rac {cmd_name}: must run as root (sudo not found on PATH)',
+          file=sys.stderr)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# frpc binary install.
+# ---------------------------------------------------------------------------
+def _frpc_arch_suffix() -> str:
+    import platform
+    machine = platform.machine()
+    if machine == 'x86_64':
+        return 'linux_amd64'
+    if machine in ('armv7l', 'armv6l'):
+        return 'linux_arm'
+    if machine == 'aarch64':
+        return 'linux_arm64'
+    raise RuntimeError(f'frpc: unsupported architecture {machine}')
+
+
+def _install_frpc(dry_run: bool = False) -> bool:
+    if _FRPC_BIN.exists():
+        r = _run([str(_FRPC_BIN), '--version'])
+        if r.returncode == 0 and _FRPC_VERSION in r.stdout:
+            _ok(f'frpc: {_FRPC_VERSION} already installed')
+            return True
+        _info(f'frpc: version mismatch, reinstalling {_FRPC_VERSION}')
+
+    try:
+        arch = _frpc_arch_suffix()
+    except RuntimeError as exc:
+        _err(str(exc))
+        return False
+
+    import urllib.request
+    import tarfile
+    import tempfile
+    tarname = f'frp_{_FRPC_VERSION}_{arch}.tar.gz'
+    url = (f'https://github.com/fatedier/frp/releases/download/'
+           f'v{_FRPC_VERSION}/{tarname}')
+
+    if dry_run:
+        _info(f'dry-run: would download {url} → {_FRPC_BIN}')
+        return True
+
+    _info(f'Downloading frpc {_FRPC_VERSION} ({arch}) ...')
+    with tempfile.TemporaryDirectory() as tmp:
+        tar_path = Path(tmp) / tarname
+        try:
+            urllib.request.urlretrieve(url, str(tar_path))
+        except Exception as exc:
+            _err(f'frpc download failed: {exc}')
+            return False
+        with tarfile.open(str(tar_path)) as tf:
+            member = next((m for m in tf.getmembers()
+                           if m.name.endswith('/frpc')), None)
+            if member is None:
+                _err('frpc not found in downloaded archive')
+                return False
+            member.name = 'frpc'
+            tf.extract(member, path=tmp)
+        frpc_extracted = Path(tmp) / 'frpc'
+        r = _run(['install', '-m', '755', str(frpc_extracted), str(_FRPC_BIN)],
+                 sudo=True)
+        if r.returncode != 0:
+            _err(f'frpc install failed: {r.stderr.strip()}')
+            return False
+
+    _ok(f'frpc: {_FRPC_VERSION} installed to {_FRPC_BIN}')
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Keypair + identity.
+# ---------------------------------------------------------------------------
+def _find_wd_pubkey():
+    for name in ('id_ed25519', 'id_rsa', 'id_ecdsa'):
+        p = _WD_SSH_DIR / f'{name}.pub'
+        if p.exists():
+            return p
+    return None
+
+
+def _ensure_frpc_keypair(dry_run: bool = False) -> bool:
+    pub = _find_wd_pubkey()
+    if pub:
+        _ok(f'frpc identity: using {_WD_USER} SSH key  →  {pub}')
+        _info('  (auto-registered on gateway via wsprdaemon uploads)')
+        return True
+
+    fallback_pub = Path(str(_FRPC_KEY) + '.pub')
+    if _FRPC_KEY.exists() and fallback_pub.exists():
+        _ok(f'frpc identity: using dedicated key  →  {_FRPC_KEY}')
+        return True
+    if dry_run:
+        _info(f'dry-run: would generate SSH keypair at {_FRPC_KEY}')
+        return True
+
+    import tempfile
+    import socket
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td) / 'frpc_id_rsa'
+        r = subprocess.run(
+            ['ssh-keygen', '-t', 'ed25519', '-N', '',
+             '-C', f'wd-rac@{socket.gethostname()}', '-f', str(tmp)],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            _err(f'ssh-keygen failed: {r.stderr.strip()}')
+            return False
+        _run(['mkdir', '-p', str(_FRPC_KEY.parent)], sudo=True)
+        _run(['install', '-m', '600', str(tmp), str(_FRPC_KEY)], sudo=True)
+        _run(['install', '-m', '644', str(tmp) + '.pub', str(_FRPC_KEY) + '.pub'],
+             sudo=True)
+    pub_txt = (fallback_pub.read_text().strip()
+               if fallback_pub.exists() else '(unreadable)')
+    _ok(f'frpc identity: generated dedicated key  →  {_FRPC_KEY}')
+    _warn('wsprdaemon SSH key not found — gateway registration is not automatic.')
+    _warn('Send this public key to the RAC administrator to register the station:')
+    _info(f'  {pub_txt}')
+    return True
+
+
+def _frpc_user_field() -> str:
+    """16-char sha256 prefix of the pubkey file, used as the frpc user id."""
+    import hashlib
+    pub = _find_wd_pubkey() or Path(str(_FRPC_KEY) + '.pub')
+    if not pub.exists():
+        return ''
+    return hashlib.sha256(pub.read_bytes()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Gateway registration (FTP bootstrap) + TLS CA cert.
+# ---------------------------------------------------------------------------
+def _bootstrap_rac_registration(rac_id: str, dry_run: bool = False) -> bool:
+    """Upload a spots-free .tbz to the gateway FTP so the server auto-provisions
+    the station's account (creates the Linux user, authorizes the SSH key)
+    before any spots have been sent.  Non-fatal: frpc retries regardless."""
+    import ftplib
+    import io
+    import tarfile
+    import time as _time
+
+    pub_path = _find_wd_pubkey() or Path(str(_FRPC_KEY) + '.pub')
+    if not pub_path.exists():
+        _warn('bootstrap: no SSH public key found — skipping FTP registration')
+        return False
+
+    pubkey = pub_path.read_text().strip()
+    upload_id = rac_id.replace('/', '_')
+    ts = _time.strftime('%y%m%d_%H%M_%S', _time.gmtime())
+    tar_name = f'{upload_id}_{ts}.tbz'
+
+    config_txt = (
+        'CLIENT_VERSION=4.0\n'
+        'UPLOADS_WSPRNET_LINE_FORMAT_VERSION=1\n'
+        'UPLOADS_WSPRDAEMON_SPOT_LINE_FORMAT_VERSION=3\n'
+        'SIGNAL_LEVEL_UPLOAD=yes\n'
+    ).encode()
+    info_txt = f'reporter_id={rac_id}\nssh_public_key={pubkey}\n'.encode()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:bz2') as tf:
+        for arcname, data in [
+            ('wsprdaemon/uploads_config.txt', config_txt),
+            ('wsprdaemon/client_upload_info.txt', info_txt),
+        ]:
+            ti = tarfile.TarInfo(name=arcname)
+            ti.size = len(data)
+            ti.mtime = int(_time.time())
+            tf.addfile(ti, io.BytesIO(data))
+    tbz_bytes = buf.getvalue()
+
+    _info(f'bootstrap: uploading registration tar {tar_name} '
+          f'({len(tbz_bytes)} B) ...')
+
+    if dry_run:
+        _info(f'dry-run: would FTP {tar_name} to gw2.wsprdaemon.org/upload/')
+        return True
+
+    ftp_server = 'gw2.wsprdaemon.org'
+    ftp_user = _secret('WD_RAC_FTP_USER', default='noisegraphs')
+    ftp_passwd = _secret('WD_RAC_FTP_PASSWD')
+    ftp_path = 'upload'
+    if not ftp_passwd:
+        _warn('bootstrap: WD_RAC_FTP_PASSWD not set — skipping gateway registration')
+        _warn(f'  set it (or add to {_SECRET_ENV_FILE}) to auto-register the station;')
+        _warn('  the frpc tunnel will still retry, completing on the first spot upload.')
+        return False
+    try:
+        with ftplib.FTP(timeout=30) as ftp:
+            ftp.connect(ftp_server)
+            ftp.login(user=ftp_user, passwd=ftp_passwd)
+            ftp.set_pasv(True)
+            ftp.storbinary(f'STOR {ftp_path}/{tar_name}', io.BytesIO(tbz_bytes))
+        _ok(f'bootstrap: registration uploaded  →  '
+            f'{ftp_server}/upload/{tar_name}')
+        _info('  Server will create the gateway account and authorize the SSH key.')
+        _info('  The frpc tunnel will connect on its next retry (≤30 s).')
+        return True
+    except Exception as exc:
+        _warn(f'bootstrap: FTP upload failed: {exc}')
+        _warn('  Tunnel will retry — registration completes after the first spot upload.')
+        return False
+
+
+def _fetch_frps_ca_cert(dry_run: bool = False) -> bool:
+    if _FRPS_CA_CERT.exists():
+        _ok(f'frps CA cert: {_FRPS_CA_CERT}')
+        return True
+    if dry_run:
+        _info(f'dry-run: would fetch TLS cert from {_FRPS_URL}:{_FRPS_PORT}')
+        return True
+    import ssl
+    import socket
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((_FRPS_URL, _FRPS_PORT), timeout=10) as raw:
+            with ctx.wrap_socket(raw) as s:
+                der = s.getpeercert(binary_form=True)
+        pem = ssl.DER_cert_to_PEM_cert(der)
+    except Exception as exc:
+        _err(f'failed to fetch frps CA cert from {_FRPS_URL}:{_FRPS_PORT}: {exc}')
+        return False
+    import tempfile
+    with tempfile.NamedTemporaryFile('w', suffix='.crt', delete=False) as tf:
+        tf.write(pem)
+        tf_path = tf.name
+    _run(['mkdir', '-p', str(_FRPS_CA_CERT.parent)], sudo=True)
+    r = _run(['install', '-m', '644', tf_path, str(_FRPS_CA_CERT)], sudo=True)
+    Path(tf_path).unlink(missing_ok=True)
+    if r.returncode != 0:
+        _err(f'failed to save CA cert: {r.stderr.strip()}')
+        return False
+    _ok(f'frps CA cert: fetched and saved  →  {_FRPS_CA_CERT}')
+    return True
+
+
+# ---------------------------------------------------------------------------
+# frpc.toml + systemd unit.
+# ---------------------------------------------------------------------------
+def _write_frpc_config(rac_id: str, rac_number: int, dry_run: bool = False) -> bool:
+    if not rac_id:
+        _err('wd-rac: rac_id is empty')
+        return False
+    if rac_number < 0:
+        _err('wd-rac: rac_number not set')
+        return False
+
+    token = _secret('WD_RAC_FRPS_TOKEN')
+    if not token:
+        if dry_run:
+            token = '<WD_RAC_FRPS_TOKEN-not-set>'
+        else:
+            _err('wd-rac: frps token not set')
+            _info(f'  export WD_RAC_FRPS_TOKEN, or add it to {_SECRET_ENV_FILE}')
+            _info('  (value = fleet-shared frps token from the public wsprdaemon smd)')
+            return False
+
+    frps_host = _FRPS_URL_HAMSCI if 200 <= rac_number <= 299 else _FRPS_URL
+    ssh_port = _RAC_PORT_BASE + rac_number
+    web_port = ssh_port + _RAC_WEB_OFFSET
+    user_field = _frpc_user_field()
+
+    local_ssh_port = 22
+    try:
+        for line in Path('/etc/ssh/sshd_config').read_text().splitlines():
+            if line.startswith('Port '):
+                local_ssh_port = int(line.split()[1])
+    except Exception:
+        pass
+
+    lines = [
+        f'serverAddr = "{frps_host}"',
+        f'serverPort = {_FRPS_PORT}',
+    ]
+    if user_field:
+        lines.append(f'user = "{user_field}"')
+    lines += [
+        '',
+        '[auth]',
+        'method = "token"',
+        f'token = "{token}"',
+        '',
+        '[transport.tls]',
+        'enable = true',
+        f'trustedCaFile = "{_FRPS_CA_CERT}"',
+        '',
+        '[webServer]',
+        'addr = "127.0.0.1"',
+        'port = 7500',
+        '',
+        '[[proxies]]',
+        f'name = "{rac_id}"',
+        'type = "tcp"',
+        'localIP = "127.0.0.1"',
+        f'localPort = {local_ssh_port}',
+        f'remotePort = {ssh_port}',
+        '',
+        '[[proxies]]',
+        f'name = "{rac_id}-WEB"',
+        'type = "tcp"',
+        'localIP = "127.0.0.1"',
+        'localPort = 8081',
+        f'remotePort = {web_port}',
+    ]
+    content = '\n'.join(lines) + '\n'
+
+    if dry_run:
+        _info(f'dry-run: would write {_FRPC_CONFIG}:\n'
+              f'{textwrap.indent(content, "     ")}')
+        return True
+
+    _run(['mkdir', '-p', str(_FRPC_CONFIG.parent)], sudo=True)
+    import tempfile
+    with tempfile.NamedTemporaryFile('w', suffix='.toml', delete=False) as tf:
+        tf.write(content)
+        tf_path = tf.name
+    # Group-own to `sigmond` (0640) if that group exists so operators can read
+    # it for status without sudo; else fall back to root:root.
+    import grp
+    try:
+        grp.getgrnam('sigmond')
+        install_cmd = ['install', '-m', '640', '-g', 'sigmond',
+                       tf_path, str(_FRPC_CONFIG)]
+    except KeyError:
+        install_cmd = ['install', '-m', '640', tf_path, str(_FRPC_CONFIG)]
+    r = _run(install_cmd, sudo=True)
+    Path(tf_path).unlink(missing_ok=True)
+    if r.returncode != 0:
+        _err(f'frpc.toml write failed: {r.stderr.strip()}')
+        return False
+    _ok(f'frpc.toml: written ({rac_id}, channel {rac_number}, port {ssh_port})')
+    return True
+
+
+def _install_rac_service(dry_run: bool = False) -> bool:
+    unit_path = Path('/etc/systemd/system/wd-rac.service')
+    unit_content = f"""\
+[Unit]
+Description=WsprDaemon Remote Access Channel (frpc tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={_FRPC_BIN} -c {_FRPC_CONFIG}
+Restart=always
+RestartSec=30s
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target
+"""
+    if dry_run:
+        _info(f'dry-run: would write {unit_path} and enable wd-rac.service')
+        return True
+
+    import tempfile
+    with tempfile.NamedTemporaryFile('w', suffix='.service', delete=False) as tf:
+        tf.write(unit_content)
+        tf_path = tf.name
+    r = _run(['install', '-m', '644', tf_path, str(unit_path)], sudo=True)
+    Path(tf_path).unlink(missing_ok=True)
+    if r.returncode != 0:
+        _err(f'wd-rac.service write failed: {r.stderr.strip()}')
+        return False
+    if _FRPC_INI.exists():
+        _run(['rm', '-f', str(_FRPC_INI)], sudo=True)
+    _run(['systemctl', 'daemon-reload'], sudo=True)
+    _run(['systemctl', 'enable', 'wd-rac.service'], sudo=True)
+    _run(['systemctl', 'restart', 'wd-rac.service'], sudo=True)
+    _ok('wd-rac.service: installed and enabled')
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Status.
+# ---------------------------------------------------------------------------
+def rac_status() -> dict:
+    result = {
+        'frpc_installed': _FRPC_BIN.exists(),
+        'frpc_version': '',
+        'config_exists': _FRPC_CONFIG.exists(),
+        'service_active': False,
+        'tunnel_ok': False,
+        'rac_id': '',
+        'rac_number': -1,
+        'ssh_port': -1,
+        'config_unreadable': False,
+    }
+    if result['frpc_installed']:
+        r = _run([str(_FRPC_BIN), '--version'])
+        if r.returncode == 0:
+            result['frpc_version'] = r.stdout.strip().split()[-1]
+
+    if result['config_exists']:
+        try:
+            import tomllib
+            with open(_FRPC_CONFIG, 'rb') as f:
+                cfg = tomllib.load(f)
+            for proxy in cfg.get('proxies', []):
+                if not proxy.get('name', '').endswith('-WEB'):
+                    result['rac_id'] = proxy.get('name', '')
+                    rp = proxy.get('remotePort', -1)
+                    result['ssh_port'] = rp
+                    result['rac_number'] = rp - _RAC_PORT_BASE if rp > 0 else -1
+                    break
+        except PermissionError:
+            result['config_unreadable'] = True
+        except Exception:
+            pass
+
+    r = _run(['systemctl', 'is-active', 'wd-rac.service'])
+    result['service_active'] = (r.returncode == 0 and r.stdout.strip() == 'active')
+
+    if result['service_active']:
+        import socket
+        try:
+            with socket.create_connection((_FRPS_URL, _FRPS_PORT), timeout=3):
+                result['tunnel_ok'] = True
+        except OSError:
+            result['tunnel_ok'] = False
+
+    return result
+
+
+def _show_status() -> int:
+    st = rac_status()
+    unit = f'{_RAC_SERVICE}.service'
+    unit_path = Path(f'/etc/systemd/system/{unit}')
+    _heading('wd-rac (frpc) remote-access tunnel')
+    if not st['frpc_installed']:
+        _warn('frpc binary not installed')
+        _info('provision with:  smd-rac install --id <ID> --number <N>')
+        return 0
+    _ok(f"frpc binary : {_FRPC_BIN} "
+        f"({st['frpc_version'] or 'unknown version'})")
+    if not st['config_exists'] or not unit_path.exists():
+        _warn(f'not configured on this host ({_FRPC_CONFIG} / {unit} missing)')
+        _info('provision with:  smd-rac install --id <ID> --number <N>')
+        return 0
+    rnum = st['rac_number']
+    frps_host = (_FRPS_URL_HAMSCI if isinstance(rnum, int)
+                 and 200 <= rnum <= 299 else _FRPS_URL)
+    _ok(f"config      : {_FRPC_CONFIG}")
+    if st.get('config_unreadable'):
+        _warn(f"            : not readable as {os.getenv('USER', 'this user')} "
+              f"— re-run as root")
+    else:
+        _info(f"rac_id      : {st['rac_id'] or '(unset)'}")
+        _info(f"rac_number  : {rnum if rnum >= 0 else '(unset)'}")
+        _info(f"ssh tunnel  : {frps_host}:"
+              f"{st['ssh_port'] if st['ssh_port'] > 0 else '?'}")
+    if st['service_active']:
+        _ok(f"service     : {unit} active")
+        if st['tunnel_ok']:
+            _ok(f"gateway     : {_FRPS_URL}:{_FRPS_PORT} reachable")
+        else:
+            _warn(f"gateway     : {_FRPS_URL}:{_FRPS_PORT} UNREACHABLE "
+                  f"— service up but tunnel not established")
+    else:
+        _warn(f"service     : {unit} inactive  (bring up with  smd-rac start)")
+    r = _run(['systemctl', 'is-enabled', unit])
+    _info(f"boot        : {r.stdout.strip() or 'unknown'}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Install orchestrator (CLI-arg driven; no topology/wsprdaemon.conf needed).
+# ---------------------------------------------------------------------------
+def _install(rac_id: str, rac_number: int, dry_run: bool, yes: bool) -> int:
+    if _need_root('install'):
+        return 1
+    _heading('wd-rac (Remote Access Channel)')
+
+    # Interactive fallback for missing id/number on a real terminal.
+    if (not rac_id or rac_number < 0) and not yes and sys.stdin.isatty():
+        try:
+            import readline  # noqa: F401 — line editing on input()
+        except Exception:
+            pass
+        print()
+        print('  wd-rac needs a RAC ID and a RAC number '
+              '(the number is assigned by the RAC administrator).')
+        if not rac_id:
+            try:
+                rac_id = input('  RAC ID (e.g. AC0G/PROX): ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+        while rac_number < 0:
+            try:
+                val = input('  RAC number (integer, required — '
+                            'Ctrl-C to abort): ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                _err('wd-rac: aborted — RAC number is required')
+                return 1
+            if not val:
+                _warn('  RAC number is required (sets your ssh tunnel port).')
+                continue
+            try:
+                rac_number = int(val)
+            except ValueError:
+                _warn(f'  "{val}" is not an integer — try again.')
+
+    if not rac_id or rac_number < 0:
+        _err('wd-rac: rac_id and rac_number are both required')
+        _info('usage:  smd-rac install --id <ID> --number <N>')
+        return 1
+
+    ok = True
+    ok = _install_frpc(dry_run) and ok
+    ok = _ensure_frpc_keypair(dry_run) and ok
+    ok = _fetch_frps_ca_cert(dry_run) and ok
+    _bootstrap_rac_registration(rac_id, dry_run)            # non-fatal
+    ok = _write_frpc_config(rac_id, rac_number, dry_run) and ok
+    ok = _install_rac_service(dry_run) and ok
+    return 0 if ok else 1
+
+
+def _lifecycle(action: str) -> int:
+    unit = f'{_RAC_SERVICE}.service'
+    unit_path = Path(f'/etc/systemd/system/{unit}')
+    if not unit_path.exists():
+        _err(f'{unit} is not installed on this host')
+        _info('provision the tunnel first:  smd-rac install --id <ID> --number <N>')
+        return 1
+    if _need_root(action):
+        return 1
+    r = _run(['systemctl', action, unit])
+    if r.returncode != 0:
+        _err(f'systemctl {action} {unit} failed: {r.stderr.strip()}')
+        return 1
+    chk = _run(['systemctl', 'is-active', unit])
+    _ok(f'{unit}: {action} → {chk.stdout.strip() or "?"}')
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI.
+# ---------------------------------------------------------------------------
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(
+        prog='smd-rac',
+        description='Standalone WsprDaemon Remote Access Channel (frpc) manager.',
+    )
+    sub = p.add_subparsers(dest='command')
+    sub.add_parser('status', help='show tunnel status (default)')
+    sub.add_parser('start', help='start wd-rac.service')
+    sub.add_parser('stop', help='stop wd-rac.service')
+    sub.add_parser('restart', help='restart wd-rac.service')
+    pi = sub.add_parser('install', help='provision frpc + register + start')
+    pi.add_argument('--id', dest='rac_id', default='',
+                    help='RAC ID / reporter id (e.g. AC0G/PROX)')
+    pi.add_argument('--number', dest='rac_number', type=int, default=-1,
+                    help='RAC number (assigned by the RAC administrator)')
+    pi.add_argument('--dry-run', action='store_true',
+                    help='show what would happen without changing anything')
+    pi.add_argument('--yes', action='store_true',
+                    help='non-interactive; do not prompt for missing id/number')
+
+    args = p.parse_args(argv)
+    cmd = args.command or 'status'
+
+    if cmd == 'status':
+        return _show_status()
+    if cmd == 'install':
+        return _install(args.rac_id.strip(), args.rac_number,
+                        args.dry_run, args.yes)
+    if cmd in ('start', 'stop', 'restart'):
+        return _lifecycle(cmd)
+    p.print_help()
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
