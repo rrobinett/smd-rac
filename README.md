@@ -11,13 +11,17 @@ hand it a RAC ID and number, and it provisions everything itself.
 ```
 git clone https://github.com/rrobinett/smd-rac.git
 cd smd-rac
-
-# one-time: provide the gateway credentials (see "Credentials" below)
-sudo install -m 600 smd-rac.env.example /etc/sigmond/smd-rac.env
-sudo $EDITOR /etc/sigmond/smd-rac.env          # fill in the two values
-
-sudo ./smd-rac install --id AC0G/PROX --number 99
+sudo ./install.sh --id AC0G/B4-PROXMOX --number 147
 ```
+
+`install.sh` bakes in the fleet-shared gateway credentials, so that single
+command provisions and starts the tunnel. Preview first with
+`sudo ./install.sh --dry-run --id … --number …`. To tear it all down later:
+`sudo ./smd-rac uninstall`.
+
+Prefer to supply the credentials yourself instead of using the baked-in
+defaults? Skip `install.sh` and use `smd-rac` directly with an env file — see
+[Credentials](#credentials).
 
 ## What it does
 
@@ -41,6 +45,7 @@ sudo ./smd-rac install --id AC0G/PROX --number 99
 |---|---|
 | `smd-rac` or `smd-rac status` | Show tunnel status (binary, config, service, gateway reachability) |
 | `smd-rac install --id <ID> --number <N>` | Full provisioning (above). `--dry-run` to preview, `--yes` to skip prompts |
+| `smd-rac uninstall` | Stop + disable the service and remove all RAC artifacts (unit, frpc, config, keypair, CA cert). `--purge` also removes the credentials env file; `--dry-run`/`--yes` as usual |
 | `smd-rac start` \| `stop` \| `restart` | Lifecycle of `wd-rac.service` |
 
 `--number` is assigned by the RAC administrator and sets your tunnel ports.
@@ -69,10 +74,12 @@ gateway FTP. No virtualenv, no other dependencies. Tested on Debian 13.
 
 ## Credentials
 
-This repo carries **no credentials**. The fleet-shared `frps` auth token and the
-gateway FTP password are read at install time from the environment or from an
-untracked env file, and written into the host's `/etc/sigmond/frpc.toml` (where
-they belong) — never committed here.
+The `smd-rac` script itself carries **no credentials** — it reads the
+fleet-shared `frps` auth token and gateway FTP password at install time from the
+environment or an untracked env file, and writes them into the host's
+`/etc/sigmond/frpc.toml` (where they belong). For convenience, **`install.sh`
+does carry the two defaults baked in** so a fresh clone can deploy in one
+command; override them by exporting the variables before running it.
 
 | Variable | Purpose | Required |
 |---|---|---|
@@ -93,10 +100,11 @@ sudo ./smd-rac install --id AC0G/PROX --number 99
 sudo WD_RAC_FRPS_TOKEN=… WD_RAC_FTP_PASSWD=… ./smd-rac install --id AC0G/PROX --number 99
 ```
 
-The two values are **not secret to this repo** — they are already published in
-the upstream (public) WsprDaemon `smd` and are what the gateway expects every
-RAC client to present. They are externalized here purely so this repository
-contains no credential literals.
+The two values are **not secret** — they are already published in the upstream
+(public) WsprDaemon `smd` and are what the gateway expects every RAC client to
+present, so the defaults baked into `install.sh` expose nothing new. Keeping
+them out of the `smd-rac` script itself just means the core tool stays free of
+credential literals; `install.sh` is the opt-in convenience layer.
 
 ## Provenance & license
 
