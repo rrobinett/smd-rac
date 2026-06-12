@@ -439,7 +439,7 @@ def _write_frpc_config(rac_id: str, rac_number: int = -1, dry_run: bool = False,
     # SSH login user is advertised to the dashboard via frpc proxy metadata:
     # the Proxmox host is root; the decoder VM uses --vm-user (default root).
     if vm_user is None:
-        vm_user = os.environ.get('WD_RAC_VM_SSH_USER', '').strip() or 'root'
+        vm_user = _secret('WD_RAC_VM_SSH_USER') or 'root'
     ssh_user = {'host-ssh': 'root', 'vm-ssh': vm_user}
     services = []                       # (name, localIP, localPort, remotePort, ssh_user)
     for svc, host, port, _proto in _DEFAULT_SERVICES:
