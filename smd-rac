@@ -398,7 +398,8 @@ def _fetch_frps_ca_cert(dry_run: bool = False) -> bool:
 # frpc.toml + systemd unit.
 # ---------------------------------------------------------------------------
 def _write_frpc_config(rac_id: str, rac_number: int = -1, dry_run: bool = False,
-                       web_local_port: int = None, vm_ip: str = None) -> bool:
+                       web_local_port: int = None, vm_ip: str = None,
+                       vm_user: str = None) -> bool:
     if not rac_id:
         _err('wd-rac: rac_id is empty')
         return False
@@ -434,8 +435,13 @@ def _write_frpc_config(rac_id: str, rac_number: int = -1, dry_run: bool = False,
     except Exception:
         pass
 
-    # Resolve advertised services (skip vm-* when no VM IP is configured).
-    services = []                       # (proxy_name, localIP, localPort, remotePort)
+    # Resolve advertised services (skip vm-* when no VM IP is configured). The
+    # SSH login user is advertised to the dashboard via frpc proxy metadata:
+    # the Proxmox host is root; the decoder VM uses --vm-user (default root).
+    if vm_user is None:
+        vm_user = os.environ.get('WD_RAC_VM_SSH_USER', '').strip() or 'root'
+    ssh_user = {'host-ssh': 'root', 'vm-ssh': vm_user}
+    services = []                       # (name, localIP, localPort, remotePort, ssh_user)
     for svc, host, port, _proto in _DEFAULT_SERVICES:
         if host == 'VM':
             if not vm_ip:
@@ -445,7 +451,8 @@ def _write_frpc_config(rac_id: str, rac_number: int = -1, dry_run: bool = False,
             port = local_ssh_port
         elif svc == 'host-ui':
             port = web_local_port
-        services.append((f'{rac_id}-{svc}', host, port, _service_port(rac_id, svc)))
+        services.append((f'{rac_id}-{svc}', host, port,
+                         _service_port(rac_id, svc), ssh_user.get(svc)))
 
     lines = [
         f'serverAddr = "{frps_host}"',
@@ -467,7 +474,7 @@ def _write_frpc_config(rac_id: str, rac_number: int = -1, dry_run: bool = False,
         'addr = "127.0.0.1"',
         'port = 7500',
     ]
-    for name, host, lport, rport in services:
+    for name, host, lport, rport, suser in services:
         lines += [
             '',
             '[[proxies]]',
@@ -477,6 +484,8 @@ def _write_frpc_config(rac_id: str, rac_number: int = -1, dry_run: bool = False,
             f'localPort = {lport}',
             f'remotePort = {rport}',
         ]
+        if suser:
+            lines.append(f'metadatas.user = "{suser}"')
     content = '\n'.join(lines) + '\n'
 
     if dry_run:
@@ -504,8 +513,9 @@ def _write_frpc_config(rac_id: str, rac_number: int = -1, dry_run: bool = False,
         _err(f'frpc.toml write failed: {r.stderr.strip()}')
         return False
     _ok(f'frpc.toml: written — {rac_id}: {len(services)} service(s)')
-    for name, host, lport, rport in services:
-        _info(f'  gw2:{rport} → {host}:{lport}   ({name})')
+    for name, host, lport, rport, suser in services:
+        u = f' as {suser}' if suser else ''
+        _info(f'  gw2:{rport} → {host}:{lport}{u}   ({name})')
     return True
 
 
@@ -660,7 +670,7 @@ _smd_rac() {
     fi
     verb="${COMP_WORDS[1]}"
     case "$verb" in
-        install)    COMPREPLY=( $(compgen -W "--id --vm-ip --web-port --dry-run --yes" -- "$cur") ) ;;
+        install)    COMPREPLY=( $(compgen -W "--id --vm-ip --vm-user --web-port --dry-run --yes" -- "$cur") ) ;;
         uninstall)  COMPREPLY=( $(compgen -W "--purge --dry-run --yes" -- "$cur") ) ;;
         completion) COMPREPLY=( $(compgen -W "--install" -- "$cur") ) ;;
         *)          COMPREPLY=() ;;
@@ -703,7 +713,8 @@ def _install_completion(dry_run: bool = False) -> bool:
 # Install orchestrator (CLI-arg driven; no topology/wsprdaemon.conf needed).
 # ---------------------------------------------------------------------------
 def _install(rac_id: str, rac_number: int, dry_run: bool, yes: bool,
-             web_local_port: int = None, vm_ip: str = None) -> int:
+             web_local_port: int = None, vm_ip: str = None,
+             vm_user: str = None) -> int:
     if _need_root('install'):
         return 1
     _heading('wd-rac (Remote Access Channel)')
@@ -735,7 +746,8 @@ def _install(rac_id: str, rac_number: int, dry_run: bool, yes: bool,
     ok = _ensure_frpc_keypair(dry_run) and ok
     ok = _fetch_frps_ca_cert(dry_run) and ok
     _bootstrap_rac_registration(rac_id, dry_run)            # non-fatal
-    ok = _write_frpc_config(rac_id, rac_number, dry_run, web_local_port, vm_ip) and ok
+    ok = _write_frpc_config(rac_id, rac_number, dry_run, web_local_port,
+                            vm_ip, vm_user) and ok
     ok = _install_rac_service(dry_run) and ok
     _install_completion(dry_run)                            # non-fatal
     return 0 if ok else 1
@@ -849,6 +861,9 @@ def main(argv=None) -> int:
     pi.add_argument('--vm-ip', dest='vm_ip', default=None,
                     help='IP of the VM whose SSH/ka9q-web to advertise '
                          '(omit to advertise host services only)')
+    pi.add_argument('--vm-user', dest='vm_user', default=None,
+                    help='SSH login user for the VM, advertised to the dashboard '
+                         '(default root; or WD_RAC_VM_SSH_USER)')
     pi.add_argument('--number', dest='rac_number', type=int, default=-1,
                     help='(legacy, ignored — rac numbers retired)')
     pi.add_argument('--dry-run', action='store_true',
@@ -881,7 +896,8 @@ def main(argv=None) -> int:
         return _show_status()
     if cmd == 'install':
         return _install(args.rac_id.strip(), args.rac_number,
-                        args.dry_run, args.yes, args.web_local_port, args.vm_ip)
+                        args.dry_run, args.yes, args.web_local_port,
+                        args.vm_ip, args.vm_user)
     if cmd == 'uninstall':
         return _uninstall(args.purge, args.dry_run, args.yes)
     if cmd == 'completion':
